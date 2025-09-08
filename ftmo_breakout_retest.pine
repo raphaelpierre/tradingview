@@ -11,6 +11,10 @@ slPtsMin             = input.int(20,       "Min SL distance (pts)", minval=1)
 session1             = input.session("0900-1100", "Session 1 (HHMM-HHMM)")
 session2             = input.session("1530-1700", "Session 2 (HHMM-HHMM)")
 limitToSessions      = input.bool(true, "Trade only inside sessions")
+oneTradePerSession   = input.bool(true, "One trade per session")
+maxLossesPerDay      = input.int(2, "Max losing trades per day", minval=1)
+dailyMaxLossUSD      = input.float(-2500, "FTMO daily max loss (USD)")
+maxTotalLossUSD      = input.float(-5000, "FTMO max loss (USD)")
 
 // Levels
 useAsiaLevels        = input.bool(true,  "Use Asia High/Low (00:00–08:00)")
@@ -36,16 +40,39 @@ plotPrevDayRange     = input.bool(true, "Plot Prev Day H/L")
 // ===================== Helpers ===================== //
 inSes(sess) =>
     time(timeframe.period, sess)
-
-inSession = not limitToSessions or inSes(session1) or inSes(session2)
+session1Active = inSes(session1)
+session2Active = inSes(session2)
 isNewDay  = ta.change(time("D"))
 
-var float dayStartNet = na
+var bool  session1Done = false
+var bool  session2Done = false
+var int   lossesToday  = 0
+var float dayStartNet  = na
 if isNewDay
     dayStartNet := strategy.netprofit
+    session1Done := false
+    session2Done := false
+    lossesToday  := 0
 
-intradayPnL = strategy.netprofit - nz(dayStartNet, strategy.netprofit)
-softStopHit = useDailySoftStop and intradayPnL <= dailySoftStopUSD
+sess1OK = session1Active and (not oneTradePerSession or not session1Done)
+sess2OK = session2Active and (not oneTradePerSession or not session2Done)
+
+intradayPnL      = strategy.netprofit - nz(dayStartNet, strategy.netprofit)
+softStopHit      = useDailySoftStop and intradayPnL <= dailySoftStopUSD
+hardDailyLossHit = intradayPnL <= dailyMaxLossUSD
+totalLossHit     = strategy.netprofit <= maxTotalLossUSD
+var float tradeStartNet = na
+if strategy.position_size[1] == 0 and strategy.position_size != 0
+    tradeStartNet := strategy.netprofit
+if strategy.position_size[1] != 0 and strategy.position_size == 0
+    tradePnL = strategy.netprofit - nz(tradeStartNet, strategy.netprofit)
+    if tradePnL < 0
+        lossesToday += 1
+
+lossLimitHit     = lossesToday >= maxLossesPerDay
+
+canTradeSession = not limitToSessions or sess1OK or sess2OK
+canTrade        = canTradeSession and not softStopHit and not hardDailyLossHit and not totalLossHit and not lossLimitHit
 
 prevHigh = usePrevDayLevels ? request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_on, barmerge.lookahead_on) : na
 prevLow  = usePrevDayLevels ? request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_on, barmerge.lookahead_on) : na
@@ -102,8 +129,13 @@ var bool  pending      = false
 var bool  pendingLong  = false
 var float pendingLevel = na
 var int   pendingSLpts = 0
+var bool  tradeIsLong  = false
+var float tradeSL      = na
+var float tradeTP      = na
+var float tradeRisk    = na
+var bool  movedToBE    = false
 
-if (breakLong or breakShort) and inSession and not softStopHit
+if (breakLong or breakShort) and canTrade
     pending      := true
     pendingLong  := breakLong
     pendingLevel := breakLevel
@@ -145,19 +177,48 @@ if entryLong
 if entryShort
     shortTP := closeNow - rrMultiple * distShort
 
-canTrade = inSession and not softStopHit
-
 if canTrade
     if entryLong and distLong >= slPtsMin * syminfo.mintick
+        tradeIsLong := true
+        tradeSL     := slPriceLong
+        tradeTP     := longTP
+        tradeRisk   := distLong
+        movedToBE   := false
         strategy.entry("LONG", strategy.long, qty=qtyLong)
-        strategy.exit("LX", from_entry="LONG", stop=slPriceLong, limit=longTP)
-        label.new(bar_index, close, text="LONG @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(slPriceLong, format.mintick)+"\nTP "+str.tostring(longTP, format.mintick), style=label.style_label_up, textcolor=color.white, color=color.new(color.teal, 0))
+        strategy.exit("LX", from_entry="LONG", stop=tradeSL, limit=tradeTP)
+        label.new(bar_index, close, text="LONG @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(tradeSL, format.mintick)+"\nTP "+str.tostring(tradeTP, format.mintick), style=label.style_label_up, textcolor=color.white, color=color.new(color.teal, 0))
         pending := false
+        if session1Active
+            session1Done := true
+        if session2Active
+            session2Done := true
     if entryShort and distShort >= slPtsMin * syminfo.mintick
+        tradeIsLong := false
+        tradeSL     := slPriceShort
+        tradeTP     := shortTP
+        tradeRisk   := distShort
+        movedToBE   := false
         strategy.entry("SHORT", strategy.short, qty=qtyShort)
-        strategy.exit("SX", from_entry="SHORT", stop=slPriceShort, limit=shortTP)
-        label.new(bar_index, close, text="SHORT @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(slPriceShort, format.mintick)+"\nTP "+str.tostring(shortTP, format.mintick), style=label.style_label_down, textcolor=color.white, color=color.new(color.maroon, 0))
+        strategy.exit("SX", from_entry="SHORT", stop=tradeSL, limit=tradeTP)
+        label.new(bar_index, close, text="SHORT @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(tradeSL, format.mintick)+"\nTP "+str.tostring(tradeTP, format.mintick), style=label.style_label_down, textcolor=color.white, color=color.new(color.maroon, 0))
         pending := false
+        if session1Active
+            session1Done := true
+        if session2Active
+            session2Done := true
+
+if strategy.position_size > 0 and tradeIsLong
+    entryPrice = strategy.position_avg_price
+    if not movedToBE and high >= entryPrice + tradeRisk
+        tradeSL := entryPrice
+        movedToBE := true
+    strategy.exit("LX", from_entry="LONG", stop=tradeSL, limit=tradeTP)
+if strategy.position_size < 0 and not tradeIsLong
+    entryPrice = strategy.position_avg_price
+    if not movedToBE and low <= entryPrice - tradeRisk
+        tradeSL := entryPrice
+        movedToBE := true
+    strategy.exit("SX", from_entry="SHORT", stop=tradeSL, limit=tradeTP)
 
 // ===================== Notes ===================== //
 // ALERTS: TradingView interdit alertcondition() dans les strategies.
