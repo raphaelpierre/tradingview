@@ -39,10 +39,10 @@ plotPrevDayRange     = input.bool(true, "Plot Prev Day H/L")
 
 // ===================== Helpers ===================== //
 inSes(sess) =>
-    time(timeframe.period, sess)
+    not na(time(timeframe.period, sess))
 session1Active = inSes(session1)
 session2Active = inSes(session2)
-isNewDay  = ta.change(time("D"))
+isNewDay  = ta.change(time("D")) != 0
 
 var bool  session1Done = false
 var bool  session2Done = false
