@@ -1,0 +1,165 @@
+//@version=5
+strategy("FTMO Breakout + Pullback (Asia/PrevDay) — v1", overlay=true, initial_capital=50000, commission_type=strategy.commission.cash_per_contract, commission_value=0.0, calc_on_every_tick=false, calc_on_order_fills=true, process_orders_on_close=true, pyramiding=0, max_labels_count=500)
+
+// ===================== Inputs ===================== //
+// Risk & Targets
+riskUSD              = input.float(250.0,  "Risk per trade (USD)")
+rrMultiple           = input.float(2.0,    "TP multiple (R)")
+slPtsMin             = input.int(20,       "Min SL distance (pts)", minval=1)
+
+// Sessions (exchange time)
+session1             = input.session("0900-1100", "Session 1 (HHMM-HHMM)")
+session2             = input.session("1530-1700", "Session 2 (HHMM-HHMM)")
+limitToSessions      = input.bool(true, "Trade only inside sessions")
+
+// Levels
+useAsiaLevels        = input.bool(true,  "Use Asia High/Low (00:00–08:00)")
+asiaStartHour        = input.int(0, "Asia start hour", minval=0, maxval=23)
+asiaEndHour          = input.int(8, "Asia end hour", minval=1, maxval=23)
+usePrevDayLevels     = input.bool(true,  "Use Previous Day High/Low")
+pullbackTolerancePts = input.int(10,     "Pullback tolerance (pts)", minval=1)
+minBreakCandleRange  = input.int(20,     "Min breakout candle range (pts)", minval=1)
+
+// Instrument economics (for sizing & backtest only)
+pointValueUSD        = input.float(10.0,  "$ per point per contract", tooltip="Ex: DAX cash ~ $10/pt; US100 cash often ~$1/pt at some brokers. Adjust to your symbol.")
+qtyMin               = input.float(0.1,   "Min qty (contracts)", step=0.01)
+qtyStep              = input.float(0.1,   "Qty step", step=0.01)
+
+// Daily soft stop (optional, backtest helper)
+useDailySoftStop     = input.bool(true,   "Use daily soft stop")
+dailySoftStopUSD     = input.float(-500,  "Soft stop P&L for the day (USD)")
+
+// Visuals
+plotAsiaRange        = input.bool(true, "Plot Asia H/L")
+plotPrevDayRange     = input.bool(true, "Plot Prev Day H/L")
+
+// ===================== Helpers ===================== //
+inSes(sess) =>
+    time(timeframe.period, sess)
+
+inSession = not limitToSessions or inSes(session1) or inSes(session2)
+isNewDay  = ta.change(time("D"))
+
+var float dayStartNet = na
+if isNewDay
+    dayStartNet := strategy.netprofit
+
+intradayPnL = strategy.netprofit - nz(dayStartNet, strategy.netprofit)
+softStopHit = useDailySoftStop and intradayPnL <= dailySoftStopUSD
+
+prevHigh = usePrevDayLevels ? request.security(syminfo.tickerid, "D", high[1], barmerge.gaps_on, barmerge.lookahead_on) : na
+prevLow  = usePrevDayLevels ? request.security(syminfo.tickerid, "D", low[1],  barmerge.gaps_on, barmerge.lookahead_on) : na
+
+inAsia = (hour >= asiaStartHour and hour < asiaEndHour)
+var float asiaHi = na
+var float asiaLo = na
+if isNewDay
+    asiaHi := na
+    asiaLo := na
+if inAsia
+    asiaHi := na(asiaHi) ? high : math.max(asiaHi, high)
+    asiaLo := na(asiaLo) ? low  : math.min(asiaLo, low)
+
+clrAsia = color.new(color.aqua, 0)
+clrPrev = color.new(color.orange, 0)
+plot(plotAsiaRange and useAsiaLevels ? asiaHi : na,  title="Asia High", color=clrAsia,  style=plot.style_linebr)
+plot(plotAsiaRange and useAsiaLevels ? asiaLo : na,  title="Asia Low",  color=clrAsia,  style=plot.style_linebr)
+plot(plotPrevDayRange and usePrevDayLevels ? prevHigh : na, title="Prev High", color=clrPrev, style=plot.style_linebr)
+plot(plotPrevDayRange and usePrevDayLevels ? prevLow  : na, title="Prev Low",  color=clrPrev, style=plot.style_linebr)
+
+// ===================== Breakout + Pullback Logic ===================== //
+o1 = open[1]
+c1 = close[1]
+h1 = high[1]
+l1 = low[1]
+rangeOK = (h1 - l1) >= minBreakCandleRange * syminfo.mintick
+
+levels = array.new_float()
+if useAsiaLevels and not na(asiaHi)
+    array.push(levels, asiaHi)
+if useAsiaLevels and not na(asiaLo)
+    array.push(levels, asiaLo)
+if usePrevDayLevels and not na(prevHigh)
+    array.push(levels, prevHigh)
+if usePrevDayLevels and not na(prevLow)
+    array.push(levels, prevLow)
+
+breakLong  = false
+breakShort = false
+float breakLevel = na
+
+for i = 0 to array.size(levels)-1
+    lv = array.get(levels, i)
+    if not na(lv)
+        if c1 > lv and o1 < lv and rangeOK
+            breakLong := true
+            breakLevel := lv
+        if c1 < lv and o1 > lv and rangeOK
+            breakShort := true
+            breakLevel := lv
+
+var bool  pending      = false
+var bool  pendingLong  = false
+var float pendingLevel = na
+var int   pendingSLpts = 0
+
+if (breakLong or breakShort) and inSession and not softStopHit
+    pending      := true
+    pendingLong  := breakLong
+    pendingLevel := breakLevel
+    pendingSLpts := math.max(minBreakCandleRange, int(math.round((h1 - l1) / syminfo.mintick)))
+
+closeNow = close
+openNow  = open
+highNow  = high
+lowNow   = low
+nearTol  = pullbackTolerancePts * syminfo.mintick
+
+rejectionOKLong  = pending and pendingLong  and ((lowNow <= pendingLevel + nearTol) and (closeNow > openNow) and (closeNow >= pendingLevel))
+rejectionOKShort = pending and not pendingLong and ((highNow >= pendingLevel - nearTol) and (closeNow < openNow) and (closeNow <= pendingLevel))
+
+entryLong  = rejectionOKLong
+entryShort = rejectionOKShort
+
+slPriceLong  = pendingLevel - nearTol
+slPriceShort = pendingLevel + nearTol
+slPtsLong    = math.max(pendingSLpts,  int(math.round((closeNow - slPriceLong)  / syminfo.mintick)))
+slPtsShort   = math.max(pendingSLpts,  int(math.round((slPriceShort - closeNow) / syminfo.mintick)))
+
+distLong  = slPtsLong  * syminfo.mintick
+distShort = slPtsShort * syminfo.mintick
+
+getQty(dist) =>
+    pts = dist / syminfo.mintick
+    raw = riskUSD / (pts * pointValueUSD)
+    stepped = math.floor(raw / qtyStep) * qtyStep
+    math.max(qtyMin, stepped)
+
+qtyLong  = getQty(distLong)
+qtyShort = getQty(distShort)
+
+float longTP  = na
+float shortTP = na
+if entryLong
+    longTP := closeNow + rrMultiple * distLong
+if entryShort
+    shortTP := closeNow - rrMultiple * distShort
+
+canTrade = inSession and not softStopHit
+
+if canTrade
+    if entryLong and distLong >= slPtsMin * syminfo.mintick
+        strategy.entry("LONG", strategy.long, qty=qtyLong)
+        strategy.exit("LX", from_entry="LONG", stop=slPriceLong, limit=longTP)
+        label.new(bar_index, close, text="LONG @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(slPriceLong, format.mintick)+"\nTP "+str.tostring(longTP, format.mintick), style=label.style_label_up, textcolor=color.white, color=color.new(color.teal, 0))
+        pending := false
+    if entryShort and distShort >= slPtsMin * syminfo.mintick
+        strategy.entry("SHORT", strategy.short, qty=qtyShort)
+        strategy.exit("SX", from_entry="SHORT", stop=slPriceShort, limit=shortTP)
+        label.new(bar_index, close, text="SHORT @ "+str.tostring(close, format.mintick)+"\nSL "+str.tostring(slPriceShort, format.mintick)+"\nTP "+str.tostring(shortTP, format.mintick), style=label.style_label_down, textcolor=color.white, color=color.new(color.maroon, 0))
+        pending := false
+
+// ===================== Notes ===================== //
+// ALERTS: TradingView interdit alertcondition() dans les strategies.
+// => Pour le live, il faut convertir ce script en "study" (indicator) et y mettre les alertcondition.
+// Ici, tu peux simplement créer une alerte manuelle sur les trades ("strategy order fill") ou dupliquer le code en version indicator.
